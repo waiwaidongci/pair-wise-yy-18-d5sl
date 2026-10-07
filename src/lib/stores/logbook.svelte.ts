@@ -1,8 +1,16 @@
-import type { DrillHole, Interval } from '$lib/types/geology';
+import type { Correlation, DraftConflict, DrillHole, Interval } from '$lib/types/geology';
 import {
   clamp,
+  createAnchorId,
   createId,
   createMockHoles,
+  draftsEqual,
+  mergeDrafts,
+  migrateDraft,
+  reattachCorrelationsOnMergeWithIds,
+  reattachCorrelationsOnSplit,
+  removeCorrelationsToHole,
+  revalidateCorrelations,
   roundDepth,
   sortIntervals,
   validateHole,
@@ -22,20 +30,37 @@ class LogbookStore {
   history = $state<DrillHole[][]>([]);
   future = $state<DrillHole[][]>([]);
   message = $state('');
+  /** 多标签页合并时的冲突段 */
+  conflicts = $state<DraftConflict[]>([]);
+  /** 旧数据升级失败时的错误信息 */
+  migrationError = $state<string | null>(null);
+  /** 升级失败保留的原稿，供重试 */
+  migrationRaw = $state<unknown>(null);
+
+  private storageListener: ((event: StorageEvent) => void) | null = null;
 
   constructor() {
     if (typeof localStorage !== 'undefined') {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
         if (raw) {
-          const parsed = JSON.parse(raw) as DrillHole[];
-          if (Array.isArray(parsed) && parsed.length) this.holes = parsed;
+          const parsed = JSON.parse(raw) as unknown;
+          const result = migrateDraft(parsed);
+          if (result.ok) {
+            this.holes = result.holes;
+          } else {
+            // 升级失败：保留原稿，等待重试
+            this.migrationError = result.error;
+            this.migrationRaw = result.raw;
+            this.holes = [];
+          }
         }
       } catch {
         this.holes = createMockHoles();
       }
     }
     this.selectedIntervalId = this.activeHole?.intervals[0]?.id ?? null;
+    this.setupStorageListener();
   }
 
   get activeHole() {
@@ -64,6 +89,27 @@ class LogbookStore {
     this.persist();
   }
 
+  /** 标签页 B 收到标签页 A 的保存：按区间标识合并，冲突段拦下 */
+  private setupStorageListener() {
+    if (typeof window === 'undefined') return;
+    this.storageListener = (event: StorageEvent) => {
+      if (event.key !== STORAGE_KEY || !event.newValue) return;
+      try {
+        const remote = JSON.parse(event.newValue) as DrillHole[];
+        if (!Array.isArray(remote)) return;
+        const { holes: merged, conflicts } = mergeDrafts(this.holes, remote);
+        if (conflicts.length) this.conflicts = [...this.conflicts, ...conflicts];
+        if (!draftsEqual(this.holes, merged)) {
+          this.holes = merged;
+          this.persist();
+        }
+      } catch {
+        // 远程草稿格式损坏，忽略
+      }
+    };
+    window.addEventListener('storage', this.storageListener);
+  }
+
   selectHole(id: string) {
     this.activeHoleId = id;
     this.selectedIntervalId = this.activeHole?.intervals[0]?.id ?? null;
@@ -74,10 +120,12 @@ class LogbookStore {
   }
 
   updateInterval(id: string, patch: Partial<Interval>) {
+    const depthChanged = patch.from !== undefined || patch.to !== undefined;
     this.commit('已更新区间属性', () => {
       const hole = this.activeHole;
       if (!hole) return;
       hole.intervals = hole.intervals.map((item) => (item.id === id ? { ...item, ...patch } : item));
+      if (depthChanged) revalidateCorrelations(this.holes);
     });
   }
 
@@ -94,6 +142,7 @@ class LogbookStore {
     this.commit(`边界调整至 ${safeDepth} m`, () => {
       current.to = safeDepth;
       next.from = safeDepth;
+      revalidateCorrelations(this.holes);
     });
   }
 
@@ -119,6 +168,7 @@ class LogbookStore {
         if (index < intervals.length - 1) intervals[index + 1].from = safe;
       }
       hole.intervals = intervals;
+      revalidateCorrelations(this.holes);
     });
   }
 
@@ -127,20 +177,32 @@ class LogbookStore {
     const interval = this.selectedInterval;
     if (!hole || !interval || interval.to - interval.from < 0.4) return;
     const middle = roundDepth(interval.from + (interval.to - interval.from) / 2);
-    const newInterval: Interval = {
+    const upper: Interval = {
+      ...interval,
+      id: createId('int'),
+      from: interval.from,
+      to: middle,
+      anchorId: interval.anchorId,
+      lithology: interval.lithology,
+      description: interval.description,
+      photoUrl: interval.photoUrl,
+    };
+    const lower: Interval = {
       ...interval,
       id: createId('int'),
       from: middle,
       to: interval.to,
+      anchorId: createAnchorId(),
       lithology: `${interval.lithology}（细分）`,
       description: '',
       photoUrl: interval.photoUrl,
     };
     this.commit('已拆分区间', () => {
-      interval.to = middle;
-      hole.intervals = sortIntervals([...hole.intervals, newInterval]);
+      // 先把引用原区间的对比线按重叠挂到子段
+      reattachCorrelationsOnSplit(this.holes, hole.id, interval, upper, lower);
+      hole.intervals = sortIntervals([...hole.intervals.filter((item) => item.id !== interval.id), upper, lower]);
     });
-    this.selectedIntervalId = newInterval.id;
+    this.selectedIntervalId = upper.id;
   }
 
   mergeSelectedWithNext() {
@@ -150,10 +212,14 @@ class LogbookStore {
     const current = intervals[index];
     const next = intervals[index + 1];
     if (!hole || !current || !next) return;
+    const removedId = next.id;
+    const removedAnchor = next.anchorId;
     this.commit('已合并相邻区间', () => {
       current.to = next.to;
       current.description = [current.description, next.description].filter(Boolean).join(' ');
-      hole.intervals = intervals.filter((item) => item.id !== next.id);
+      // 合并前处理连线：目标不同则标待重连，并统一改挂到合并段
+      reattachCorrelationsOnMergeWithIds(this.holes, hole.id, current, removedId, removedAnchor);
+      hole.intervals = intervals.filter((item) => item.id !== removedId);
     });
     this.selectedIntervalId = current.id;
   }
@@ -170,6 +236,7 @@ class LogbookStore {
       intervals: [
         {
           id: createId('int'),
+          anchorId: createAnchorId(),
           from: 0,
           to: 40,
           lithology: '待编录',
@@ -195,6 +262,7 @@ class LogbookStore {
     this.commit('已删除钻孔', () => {
       this.holes = this.holes.filter((item) => item.id !== id);
       this.comparisonIds = this.comparisonIds.filter((item) => item !== id);
+      removeCorrelationsToHole(this.holes, id);
     });
     this.activeHoleId = this.holes[0].id;
     this.selectedIntervalId = this.holes[0].intervals[0]?.id ?? null;
@@ -213,26 +281,45 @@ class LogbookStore {
       const source = this.holes.find((item) => item.id === sourceHoleId);
       const target = this.holes.find((item) => item.id === targetHoleId);
       if (!source || !target) return;
-      const color = source.intervals.find((item) => item.id === sourceIntervalId)?.color ?? '#64748b';
+      const sourceInterval = source.intervals.find((item) => item.id === sourceIntervalId);
+      const targetInterval = target.intervals.find((item) => item.id === targetIntervalId);
+      if (!sourceInterval || !targetInterval) return;
+      const color = sourceInterval.color ?? '#64748b';
+      const make = (
+        intervalId: string,
+        anchorId: string,
+        tHoleId: string,
+        tIntervalId: string,
+        tAnchorId: string,
+      ): Correlation => ({
+        id: createId('corr'),
+        intervalId,
+        anchorId,
+        targetHoleId: tHoleId,
+        targetIntervalId: tIntervalId,
+        targetAnchorId: tAnchorId,
+        color,
+        status: 'active',
+      });
       source.correlations = [
         ...source.correlations.filter((item) => item.targetHoleId !== targetHoleId),
-        {
-          id: createId('corr'),
-          intervalId: sourceIntervalId,
+        make(
+          sourceIntervalId,
+          sourceInterval.anchorId,
           targetHoleId,
           targetIntervalId,
-          color,
-        },
+          targetInterval.anchorId,
+        ),
       ];
       target.correlations = [
         ...target.correlations.filter((item) => item.targetHoleId !== sourceHoleId),
-        {
-          id: createId('corr'),
-          intervalId: targetIntervalId,
-          targetHoleId: sourceHoleId,
-          targetIntervalId: sourceIntervalId,
-          color,
-        },
+        make(
+          targetIntervalId,
+          targetInterval.anchorId,
+          sourceHoleId,
+          sourceIntervalId,
+          sourceInterval.anchorId,
+        ),
       ];
     });
   }
@@ -243,6 +330,53 @@ class LogbookStore {
         hole.correlations = [];
       });
     });
+  }
+
+  /** 采用远程区间深度（解决冲突） */
+  adoptRemoteDepth(conflict: DraftConflict) {
+    this.commit('已采用远程深度', () => {
+      const hole = this.holes.find((item) => item.id === conflict.holeId);
+      if (!hole) return;
+      const intervals = sortIntervals(hole.intervals);
+      const index = intervals.findIndex((item) => item.id === conflict.intervalId);
+      const interval = intervals[index];
+      if (!interval) return;
+      interval.from = conflict.remote.from;
+      interval.to = conflict.remote.to;
+      // 同步相邻区间边界，保持连续
+      if (index > 0) intervals[index - 1].to = conflict.remote.from;
+      if (index < intervals.length - 1) intervals[index + 1].from = conflict.remote.to;
+      hole.intervals = intervals;
+      revalidateCorrelations(this.holes);
+    });
+    this.conflicts = this.conflicts.filter(
+      (item) =>
+        !(item.holeId === conflict.holeId && item.intervalId === conflict.intervalId),
+    );
+  }
+
+  /** 保留本地深度（解决冲突） */
+  keepLocalDepth(conflict: DraftConflict) {
+    this.conflicts = this.conflicts.filter(
+      (item) =>
+        !(item.holeId === conflict.holeId && item.intervalId === conflict.intervalId),
+    );
+  }
+
+  /** 升级失败后重试 */
+  retryMigration() {
+    if (this.migrationRaw === null) return;
+    const result = migrateDraft(this.migrationRaw);
+    if (result.ok) {
+      this.holes = result.holes;
+      this.migrationError = null;
+      this.migrationRaw = null;
+      this.selectedIntervalId = this.activeHole?.intervals[0]?.id ?? null;
+      this.persist();
+    } else {
+      this.migrationError = result.error;
+      this.migrationRaw = result.raw;
+    }
   }
 
   undo() {
@@ -271,9 +405,11 @@ class LogbookStore {
     this.selectedIntervalId = this.holes[0].intervals[0].id;
     this.history = [];
     this.future = [];
+    this.conflicts = [];
+    this.migrationError = null;
+    this.migrationRaw = null;
     this.persist();
   }
 }
 
 export const logbook = new LogbookStore();
-

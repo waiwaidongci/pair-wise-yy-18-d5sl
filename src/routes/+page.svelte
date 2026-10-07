@@ -3,6 +3,7 @@
   import DepthLog from '$lib/components/DepthLog.svelte';
   import IntervalTable from '$lib/components/IntervalTable.svelte';
   import PhotoPanel from '$lib/components/PhotoPanel.svelte';
+  import ConflictBanner from '$lib/components/ConflictBanner.svelte';
   import { logbook } from '$lib/stores/logbook.svelte';
   import { downloadJson, printLog } from '$lib/utils/exports';
 
@@ -117,6 +118,8 @@
         {#each logbook.errors as error}<span>{error}</span>{/each}
       </div>
     {/if}
+
+    <ConflictBanner />
 
     <div class="editor-grid">
       <section class="log-card">

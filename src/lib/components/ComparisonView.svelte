@@ -1,6 +1,7 @@
 <script lang="ts">
   import DepthLog from './DepthLog.svelte';
-  import type { DrillHole, Interval } from '$lib/types/geology';
+  import type { Correlation, DrillHole, Interval } from '$lib/types/geology';
+  import { findIntervalByAnchor } from '$lib/utils/geology';
 
   interface Props {
     holes: DrillHole[];
@@ -42,11 +43,32 @@
     return holes.find((item) => item.id === targetHoleId)?.intervals ?? [];
   }
 
-  function intervalMidpoint(hole: DrillHole, intervalId: string) {
-    const item = hole.intervals.find((interval) => interval.id === intervalId);
+  function intervalMidpoint(hole: DrillHole, intervalId: string, anchorId?: string) {
+    const item =
+      hole.intervals.find((interval) => interval.id === intervalId) ??
+      (anchorId ? findIntervalByAnchor(hole, anchorId) : null);
     if (!item) return (topDepth + bottomDepth) / 2;
     return (Math.max(item.from, topDepth) + Math.min(item.to, bottomDepth)) / 2;
   }
+
+  function correlationDepths(hole: DrillHole, correlation: Correlation) {
+    const targetHole = holes.find((candidate) => candidate.id === correlation.targetHoleId);
+    const sourceDepth = intervalMidpoint(hole, correlation.intervalId, correlation.anchorId);
+    const targetDepth = targetHole
+      ? intervalMidpoint(targetHole, correlation.targetIntervalId, correlation.targetAnchorId)
+      : sourceDepth;
+    return { sourceDepth, targetDepth };
+  }
+
+  function yForDepth(depth: number) {
+    return 32 + ((depth - topDepth) / Math.max(1, bottomDepth - topDepth)) * 694;
+  }
+
+  const STATUS_LABEL: Record<Correlation['status'], string> = {
+    active: '',
+    pending: '待重连',
+    invalid: '已失效',
+  };
 </script>
 
 <div class="comparison-toolbar">
@@ -114,18 +136,27 @@
       {#if index < holes.length - 1}
         <svg class="correlation-lines" viewBox="0 0 100 760" preserveAspectRatio="none" aria-hidden="true">
           {#each hole.correlations.filter((item) => holes.some((candidate) => candidate.id === item.targetHoleId)) as correlation}
-            {@const targetHole = holes.find((candidate) => candidate.id === correlation.targetHoleId)}
-            {@const sourceDepth = intervalMidpoint(hole, correlation.intervalId)}
-            {@const targetDepth = targetHole ? intervalMidpoint(targetHole, correlation.targetIntervalId) : sourceDepth}
+            {@const { sourceDepth, targetDepth } = correlationDepths(hole, correlation)}
+            {@const y1 = yForDepth(sourceDepth)}
+            {@const y2 = yForDepth(targetDepth)}
             <line
               x1="0"
               x2="100"
-              y1={32 + ((sourceDepth - topDepth) / Math.max(1, bottomDepth - topDepth)) * 694}
-              y2={32 + ((targetDepth - topDepth) / Math.max(1, bottomDepth - topDepth)) * 694}
+              y1={y1}
+              y2={y2}
+              class="corr-line"
+              class:pending={correlation.status === 'pending'}
+              class:invalid={correlation.status === 'invalid'}
               stroke={correlation.color}
               stroke-width="2"
               vector-effect="non-scaling-stroke"
             />
+            {#if correlation.status !== 'active'}
+              <g class="corr-status {correlation.status}" transform={`translate(50, ${(y1 + y2) / 2})`}>
+                <rect x="-22" y="-9" width="44" height="18" rx="9" class="status-bg" />
+                <text y="3" text-anchor="middle" class="status-text">{STATUS_LABEL[correlation.status]}</text>
+              </g>
+            {/if}
           {/each}
         </svg>
       {/if}
@@ -153,6 +184,12 @@
   .column-heading strong { display: block; font-size: 13px; color: #172033; }
   .column-heading span { display: block; color: #64748b; font-size: 9px; margin-top: 2px; }
   .correlation-lines { flex: 1 1 40px; min-width: 38px; height: 760px; margin-top: 47px; overflow: visible; opacity: .8; }
+  .corr-line.pending { stroke-dasharray: 6 4; opacity: .7; }
+  .corr-line.invalid { stroke-dasharray: 2 4; opacity: .45; }
+  .status-bg { fill: #fff; stroke: currentColor; stroke-width: 1; }
+  .corr-status.pending { color: #b45309; }
+  .corr-status.invalid { color: #b91c1c; }
+  .status-text { font-size: 9px; font-weight: 700; fill: currentColor; }
   .comparison-legend { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; color: #64748b; font-size: 10px; }
   .comparison-legend i { display: inline-block; width: 26px; height: 2px; background: #4f46e5; vertical-align: middle; margin-right: 5px; }
   @media (max-width: 900px) {

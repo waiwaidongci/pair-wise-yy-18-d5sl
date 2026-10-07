@@ -1,5 +1,6 @@
 <script lang="ts">
   import ComparisonView from '$lib/components/ComparisonView.svelte';
+  import ConflictBanner from '$lib/components/ConflictBanner.svelte';
   import { logbook } from '$lib/stores/logbook.svelte';
 
   let topDepth = $state(0);
@@ -50,6 +51,8 @@
       <label>显示底部<input type="number" bind:value={bottomDepth} min={topDepth + 1} step="1" /></label>
     </div>
   </section>
+
+  <ConflictBanner />
 
   {#if comparisonHoles.length >= 2}
     <ComparisonView
