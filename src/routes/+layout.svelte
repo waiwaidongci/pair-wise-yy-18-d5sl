@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state';
+  import SyncBanners from '$lib/components/SyncBanners.svelte';
   import { logbook } from '$lib/stores/logbook.svelte';
   import '../app.css';
 
@@ -25,6 +26,7 @@
       <span>{logbook.holes.length} 孔 · {logbook.message || '本地自动保存'}</span>
     </div>
   </header>
+  <SyncBanners />
   {@render children()}
 </div>
 

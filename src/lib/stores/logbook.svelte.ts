@@ -1,4 +1,18 @@
 import type { DrillHole, Interval } from '$lib/types/geology';
+import type { ConflictSide, MergeConflict, MigrationStatus } from '$lib/services/draftSync';
+import {
+  buildCorrelationRecords,
+  findInterval,
+  pruneRemovedHole,
+  reconcileAfterBoundary,
+  remapOnMerge,
+  remapOnSplit,
+} from '$lib/services/correlations';
+import {
+  conflictKey,
+  DraftRepository,
+  type MergeResult,
+} from '$lib/services/draftSync';
 import {
   clamp,
   createId,
@@ -7,8 +21,6 @@ import {
   sortIntervals,
   validateHole,
 } from '$lib/utils/geology';
-
-const STORAGE_KEY = 'core-column:holes';
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -22,20 +34,37 @@ class LogbookStore {
   history = $state<DrillHole[][]>([]);
   future = $state<DrillHole[][]>([]);
   message = $state('');
+  /** 多标签页同时保存产生的冲突，未解决前保存会被拦下 */
+  syncConflicts = $state<MergeConflict[]>([]);
+  migration = $state<MigrationStatus>({ state: 'none' });
+
+  private repo: DraftRepository;
 
   constructor() {
-    if (typeof localStorage !== 'undefined') {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw) as DrillHole[];
-          if (Array.isArray(parsed) && parsed.length) this.holes = parsed;
-        }
-      } catch {
-        this.holes = createMockHoles();
-      }
+    const storage = typeof localStorage !== 'undefined' ? localStorage : undefined;
+    this.repo = new DraftRepository(storage ?? memoryStorage());
+    const { envelope, migration } = this.repo.load();
+    this.migration = migration;
+    if (envelope) {
+      this.holes = envelope.holes;
+    } else if (migration.state !== 'failed') {
+      this.bootstrapMock();
     }
     this.selectedIntervalId = this.activeHole?.intervals[0]?.id ?? null;
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('storage', (event) => {
+        if (event.key !== 'core-column:draft:v2' || !event.newValue) return;
+        this.handleRemoteDraft();
+      });
+    }
+  }
+
+  private bootstrapMock() {
+    // 首次使用（无任何本地数据）：落一份 v2 草稿，建立合并基准
+    this.holes = createMockHoles();
+    this.repo.resetBase(this.holes);
+    this.persist('已载入示例钻孔');
   }
 
   get activeHole() {
@@ -50,18 +79,85 @@ class LogbookStore {
     return this.activeHole ? validateHole(this.activeHole) : [];
   }
 
-  private persist() {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.holes));
+  /** 待重连 / 已失效的连线，供对比页问题面板提示 */
+  get issueCorrelations() {
+    return this.holes.flatMap((hole) =>
+      hole.correlations
+        .filter((item) => item.status !== 'active')
+        .map((item) => ({ hole, correlation: item })),
+    );
+  }
+
+  private persist(label: string, refetchAfter = false): MergeResult | null {
+    if (this.migration.state === 'failed') {
+      // 升级失败：原稿保留期间不允许覆盖
+      this.message = '旧数据升级失败，原稿已保留，请先处理升级';
+      return null;
     }
+    const result = this.repo.save(this.holes);
+    if (!result.clean) {
+      this.syncConflicts = result.conflicts;
+      this.message = `保存被拦下：${result.conflicts.length} 处与另一标签页冲突`;
+      return result;
+    }
+    this.syncConflicts = [];
+    this.message = label;
+    if (refetchAfter) this.holes = result.holes;
+    return result;
   }
 
   private commit(label: string, mutation: () => void) {
     this.history = [...this.history.slice(-39), clone(this.holes)];
     this.future = [];
     mutation();
-    this.message = label;
-    this.persist();
+    this.persist(label);
+  }
+
+  private handleRemoteDraft() {
+    const merged = this.repo.ingestRemote(this.holes);
+    if (merged.clean) {
+      this.holes = merged.holes;
+      this.syncConflicts = [];
+    } else {
+      this.syncConflicts = merged.conflicts;
+    }
+  }
+
+  retryMigration() {
+    const { envelope, migration } = this.repo.retryMigration();
+    this.migration = migration;
+    if (envelope) {
+      this.holes = envelope.holes;
+      this.syncConflicts = [];
+      this.activeHoleId = this.holes[0]?.id ?? '';
+      this.selectedIntervalId = this.holes[0]?.intervals[0]?.id ?? null;
+      this.message = '旧数据已按现有连线补出锚点并升级';
+    }
+  }
+
+  resolveConflicts(resolutions: Record<string, ConflictSide>) {
+    const map = new Map(Object.entries(resolutions));
+    const result = this.repo.resolveWith(this.holes, map);
+    if (result.clean) {
+      this.holes = result.holes;
+      this.syncConflicts = [];
+      this.message = '冲突已解决并合并保存';
+    } else {
+      this.syncConflicts = result.conflicts;
+      this.message = `仍有 ${result.conflicts.length} 处冲突未解决`;
+    }
+  }
+
+  discardRemoteConflicts() {
+    // 放弃本页未保存的冲突段编辑，以他页已保存稿为准
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('core-column:draft:v2') : null;
+    if (raw) {
+      const envelope = JSON.parse(raw);
+      this.holes = envelope.holes;
+      this.repo.resetBase(envelope.baseHoles ?? envelope.holes);
+      this.syncConflicts = [];
+      this.message = '已采用另一标签页的版本';
+    }
   }
 
   selectHole(id: string) {
@@ -91,9 +187,11 @@ class LogbookStore {
     const lower = current.from + 0.2;
     const upper = next.to - 0.2;
     const safeDepth = roundDepth(clamp(depth, lower, upper));
+    if (safeDepth === current.to) return;
     this.commit(`边界调整至 ${safeDepth} m`, () => {
       current.to = safeDepth;
       next.from = safeDepth;
+      reconcileAfterBoundary(this.holes);
     });
   }
 
@@ -119,6 +217,7 @@ class LogbookStore {
         if (index < intervals.length - 1) intervals[index + 1].from = safe;
       }
       hole.intervals = intervals;
+      reconcileAfterBoundary(this.holes);
     });
   }
 
@@ -126,6 +225,9 @@ class LogbookStore {
     const hole = this.activeHole;
     const interval = this.selectedInterval;
     if (!hole || !interval || interval.to - interval.from < 0.4) return;
+    const parentFrom = interval.from;
+    const parentTo = interval.to;
+    const parentId = interval.id;
     const middle = roundDepth(interval.from + (interval.to - interval.from) / 2);
     const newInterval: Interval = {
       ...interval,
@@ -139,6 +241,7 @@ class LogbookStore {
     this.commit('已拆分区间', () => {
       interval.to = middle;
       hole.intervals = sortIntervals([...hole.intervals, newInterval]);
+      remapOnSplit(this.holes, hole.id, parentId, [parentId, newInterval.id], parentFrom, parentTo);
     });
     this.selectedIntervalId = newInterval.id;
   }
@@ -150,10 +253,13 @@ class LogbookStore {
     const current = intervals[index];
     const next = intervals[index + 1];
     if (!hole || !current || !next) return;
+    const keptId = current.id;
+    const removedId = next.id;
     this.commit('已合并相邻区间', () => {
       current.to = next.to;
       current.description = [current.description, next.description].filter(Boolean).join(' ');
-      hole.intervals = intervals.filter((item) => item.id !== next.id);
+      hole.intervals = intervals.filter((item) => item.id !== removedId);
+      remapOnMerge(this.holes, hole.id, keptId, removedId);
     });
     this.selectedIntervalId = current.id;
   }
@@ -193,6 +299,7 @@ class LogbookStore {
   removeHole(id: string) {
     if (this.holes.length <= 1) return;
     this.commit('已删除钻孔', () => {
+      pruneRemovedHole(this.holes, id);
       this.holes = this.holes.filter((item) => item.id !== id);
       this.comparisonIds = this.comparisonIds.filter((item) => item !== id);
     });
@@ -212,28 +319,95 @@ class LogbookStore {
     this.commit('已连接地层线', () => {
       const source = this.holes.find((item) => item.id === sourceHoleId);
       const target = this.holes.find((item) => item.id === targetHoleId);
-      if (!source || !target) return;
-      const color = source.intervals.find((item) => item.id === sourceIntervalId)?.color ?? '#64748b';
-      source.correlations = [
-        ...source.correlations.filter((item) => item.targetHoleId !== targetHoleId),
-        {
-          id: createId('corr'),
-          intervalId: sourceIntervalId,
-          targetHoleId,
-          targetIntervalId,
-          color,
-        },
-      ];
-      target.correlations = [
-        ...target.correlations.filter((item) => item.targetHoleId !== sourceHoleId),
-        {
-          id: createId('corr'),
-          intervalId: targetIntervalId,
-          targetHoleId: sourceHoleId,
-          targetIntervalId: sourceIntervalId,
-          color,
-        },
-      ];
+      const sourceInterval = findInterval(source!, sourceIntervalId);
+      const targetInterval = findInterval(target!, targetIntervalId);
+      if (!source || !target || !sourceInterval || !targetInterval) return;
+      // 同孔对之间只保留最新一条连线：旧活动线与待重连/失效线一并移除
+      this.removePairBetween(source, target.id);
+      this.removePairBetween(target, source.id);
+      const records = buildCorrelationRecords(source, sourceInterval, target, targetInterval);
+      source.correlations = [...source.correlations, records.source];
+      target.correlations = [...target.correlations, records.target];
+      reconcileAfterBoundary(this.holes);
+    });
+  }
+
+  /** 清理两个钻孔之间的全部逻辑连线（按 pairId 成对删除，不误伤连向其他孔的线） */
+  private removePairBetween(hole: DrillHole, otherHoleId: string) {
+    const pairIds = new Set(
+      hole.correlations.filter((item) => item.targetHoleId === otherHoleId).map((item) => item.pairId),
+    );
+    if (!pairIds.size) return;
+    hole.correlations = hole.correlations.filter((item) => !pairIds.has(item.pairId));
+    const other = this.holes.find((item) => item.id === otherHoleId);
+    if (other) {
+      other.correlations = other.correlations.filter((item) => !pairIds.has(item.pairId));
+    }
+  }
+
+  /** 问题面板：删除一条（待重连/失效）逻辑连线的两端记录 */
+  removeCorrelationPair(holeId: string, pairId: string) {
+    this.commit('已移除问题连线', () => {
+      this.holes.forEach((hole) => {
+        hole.correlations = hole.correlations.filter(
+          (item) =>
+            !(
+              item.pairId === pairId &&
+              (hole.id === holeId || item.targetHoleId === holeId)
+            ),
+        );
+      });
+    });
+  }
+
+  /** 问题面板：按新层位重新连接一条待重连/失效连线 */
+  reconnectCorrelation(
+    holeId: string,
+    pairId: string,
+    newTargetHoleId: string,
+    newTargetIntervalId: string,
+  ) {
+    this.commit('已重新连接地层线', () => {
+      const sourceHole = this.holes.find((hole) => hole.id === holeId);
+      const sourceRecord = sourceHole?.correlations.find((item) => item.pairId === pairId);
+      if (!sourceHole || !sourceRecord) return;
+      const sourceInterval = sourceHole.intervals.find((item) => item.id === sourceRecord.intervalId);
+      const targetHole = this.holes.find((hole) => hole.id === newTargetHoleId);
+      const targetInterval = targetHole?.intervals.find((item) => item.id === newTargetIntervalId);
+      if (!sourceInterval || !targetHole || !targetInterval) return;
+
+      const oldTargetHoleId = sourceRecord.targetHoleId;
+      sourceRecord.targetHoleId = targetHole.id;
+      sourceRecord.targetIntervalId = targetInterval.id;
+      sourceRecord.anchorDepth = (sourceInterval.from + sourceInterval.to) / 2;
+      sourceRecord.targetAnchorDepth = (targetInterval.from + targetInterval.to) / 2;
+      sourceRecord.status = 'active';
+      sourceRecord.reason = '';
+      sourceRecord.color = sourceInterval.color;
+
+      // 对端记录可能要迁到新的目标孔
+      const mateHole = this.holes.find(
+        (hole) =>
+          hole.id !== sourceHole.id &&
+          hole.correlations.some((item) => item.pairId === pairId),
+      );
+      const mate = mateHole?.correlations.find((item) => item.pairId === pairId);
+      if (mate && mateHole) {
+        if (mateHole.id !== targetHole.id) {
+          mateHole.correlations = mateHole.correlations.filter((item) => item !== mate);
+          targetHole.correlations = [...targetHole.correlations, mate];
+        }
+        mate.targetHoleId = sourceHole.id;
+        mate.targetIntervalId = sourceInterval.id;
+        mate.intervalId = targetInterval.id;
+        mate.anchorDepth = (targetInterval.from + targetInterval.to) / 2;
+        mate.targetAnchorDepth = (sourceInterval.from + sourceInterval.to) / 2;
+        mate.status = 'active';
+        mate.reason = '';
+        mate.color = sourceInterval.color;
+      }
+      void oldTargetHoleId;
+      reconcileAfterBoundary(this.holes);
     });
   }
 
@@ -252,7 +426,7 @@ class LogbookStore {
     this.holes = clone(previous);
     this.history = this.history.slice(0, -1);
     this.message = '已撤销';
-    this.persist();
+    this.persist('已撤销');
   }
 
   redo() {
@@ -262,7 +436,7 @@ class LogbookStore {
     this.holes = clone(next);
     this.future = this.future.slice(1);
     this.message = '已重做';
-    this.persist();
+    this.persist('已重做');
   }
 
   reset() {
@@ -271,9 +445,25 @@ class LogbookStore {
     this.selectedIntervalId = this.holes[0].intervals[0].id;
     this.history = [];
     this.future = [];
-    this.persist();
+    this.repo.resetBase(this.holes);
+    this.migration = { state: 'none' };
+    this.syncConflicts = [];
+    this.persist('已重置为示例数据');
   }
 }
 
-export const logbook = new LogbookStore();
+function memoryStorage(): Storage {
+  const map = new Map<string, string>();
+  return {
+    get length() {
+      return map.size;
+    },
+    clear: () => map.clear(),
+    getItem: (key: string) => map.get(key) ?? null,
+    key: (index: number) => [...map.keys()][index] ?? null,
+    removeItem: (key: string) => void map.delete(key),
+    setItem: (key: string, value: string) => void map.set(key, value),
+  };
+}
 
+export const logbook = new LogbookStore();

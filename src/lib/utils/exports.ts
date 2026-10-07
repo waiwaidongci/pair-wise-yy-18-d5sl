@@ -1,8 +1,9 @@
 import type { DrillHole } from '$lib/types/geology';
+import { SCHEMA_V2, type DraftEnvelope } from '$lib/services/draftSync';
 
 export function downloadJson(holes: DrillHole[], activeHoleId: string) {
   const payload = {
-    schema: 'core-column/v1',
+    schema: SCHEMA_V2,
     exportedAt: new Date().toISOString(),
     activeHoleId,
     holes,
@@ -20,3 +21,4 @@ export function printLog() {
   window.print();
 }
 
+export type { DraftEnvelope };

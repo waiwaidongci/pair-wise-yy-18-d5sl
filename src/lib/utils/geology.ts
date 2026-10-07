@@ -1,4 +1,5 @@
 import type { DrillHole, Interval, LithologyOption } from '../types/geology';
+import { buildCorrelationRecords } from '../services/correlations';
 
 export const LITHOLOGY_OPTIONS: LithologyOption[] = [
   { name: '腐殖土', color: '#8b6f47' },
@@ -107,7 +108,7 @@ function interval(
 }
 
 export function createMockHoles(): DrillHole[] {
-  return [
+  const holes: DrillHole[] = [
     {
       id: 'ZK-1201',
       name: 'ZK-1201',
@@ -159,6 +160,26 @@ export function createMockHoles(): DrillHole[] {
       correlations: [],
     },
   ];
+
+  attachDefaultCorrelations(holes);
+  return holes;
+}
+
+/** 示例数据：相邻钻孔按同类岩性自动连一条对比线。 */
+function attachDefaultCorrelations(holes: DrillHole[]) {
+  for (let i = 0; i < holes.length; i += 1) {
+    for (let j = i + 1; j < holes.length; j += 1) {
+      const a = holes[i];
+      const b = holes[j];
+      for (const sourceInterval of a.intervals) {
+        const targetInterval = b.intervals.find((item) => item.lithology === sourceInterval.lithology);
+        if (!targetInterval) continue;
+        const records = buildCorrelationRecords(a, sourceInterval, b, targetInterval);
+        a.correlations.push(records.source);
+        b.correlations.push(records.target);
+      }
+    }
+  }
 }
 
 export function intervalAtDepth(hole: DrillHole, depth: number) {

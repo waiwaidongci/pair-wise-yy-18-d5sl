@@ -69,6 +69,9 @@
       }}
       onConnect={(sourceHoleId, sourceIntervalId, targetHoleId, targetIntervalId) =>
         logbook.addCorrelation(sourceHoleId, sourceIntervalId, targetHoleId, targetIntervalId)}
+      onReconnect={(holeId, pairId, targetHoleId, targetIntervalId) =>
+        logbook.reconnectCorrelation(holeId, pairId, targetHoleId, targetIntervalId)}
+      onRemovePair={(holeId, pairId) => logbook.removeCorrelationPair(holeId, pairId)}
     />
   {:else}
     <div class="compare-empty">至少选择两个钻孔才能进行地层对比。</div>
