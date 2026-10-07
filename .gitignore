@@ -1,0 +1,8 @@
+node_modules
+.svelte-kit
+build
+dist
+.vite
+*.log
+*.tsbuildinfo
+.DS_Store

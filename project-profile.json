@@ -1,0 +1,12 @@
+{
+  "projectId": "pair-wise-yy-18",
+  "projectName": "CoreColumn 地质钻芯编录与柱状图编辑器",
+  "category": "地质编录",
+  "businessDomain": "地质勘探",
+  "projectForm": "完整项目",
+  "codeScope": "frontend",
+  "languages": "SvelteKit, TypeScript, Vite, Skeleton, Svelte 5 runes, SVG",
+  "summary": "按深度区间录入岩性、颜色、结构、蚀变与矿化并关联钻芯照片，支持边界拖动、缩放平移、多孔对比、地层连线和结构化导出。",
+  "containerized": false
+}
+
